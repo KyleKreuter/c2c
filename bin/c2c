@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+#
+# c2c — Claude-to-Claude messaging over the cmux Unix socket.
+#
+# Two channels between running Claude Code instances (cmux "surfaces"):
+#
+#   1. Keystroke (immediate): send text straight into a peer's prompt.
+#        c2c send/ask/ping   — arrives now, even mid-work.
+#   2. Mailbox (Stop-hook, push-on-idle): drop a message in a peer's inbox;
+#        its Stop hook injects it the next time the peer goes idle — no
+#        keystrokes into the input line.
+#        c2c post            — sender side.
+#        c2c stop-hook       — receiver side, wired as a Stop hook.
+#
+set -uo pipefail
+
+CMUX_BIN="${CMUX_BIN:-cmux}"
+C2C_HOME="${C2C_HOME:-$HOME/.c2c}"
+
+die() { printf 'c2c: %s\n' "$*" >&2; exit 1; }
+command -v "$CMUX_BIN" >/dev/null 2>&1 || die "cmux CLI nicht gefunden (setze CMUX_BIN)"
+
+# Sleep without the `sleep` binary (blocked in some sandboxes).
+_nap() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1" 2>/dev/null || sleep "$1" 2>/dev/null || true; }
+
+# My own surface ref (surface:N). Empty if not inside cmux.
+_self_ref() { "$CMUX_BIN" identify --json 2>/dev/null | sed -n 's/.*"surface_ref"[^"]*"\([^"]*\)".*/\1/p' | head -n1; }
+
+# My own surface UUID — cheap: straight from the inherited env, fallback to identify.
+_self_uuid() {
+  if [ -n "${CMUX_SURFACE_ID:-}" ]; then printf '%s' "$CMUX_SURFACE_ID"; return; fi
+  "$CMUX_BIN" tree --all --id-format both 2>/dev/null \
+    | grep -oiE "surface $(_self_ref) [0-9a-f-]{36}" | grep -oiE '[0-9a-f-]{36}' | head -n1
+}
+
+# Resolve a target (surface:N ref OR raw UUID) to a UUID.
+_resolve_uuid() {
+  local t="$1"
+  if printf '%s' "$t" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    printf '%s' "$t"; return 0
+  fi
+  "$CMUX_BIN" tree --all --id-format both 2>/dev/null \
+    | grep -oiE "surface ${t} [0-9a-f-]{36}" | grep -oiE '[0-9a-f-]{36}' | head -n1
+}
+
+# Mailbox backend (envelope store: threads, replies, receipts, groups).
+MAIL() { python3 "$HOME/.claude/skills/c2c/bin/c2c_mail.py" "$@"; }
+
+_tree_both() { "$CMUX_BIN" tree --all --id-format both 2>/dev/null; }
+# All surface UUIDs (broadcast --all).
+_all_uuids() { _tree_both | grep -oiE 'surface surface:[0-9]+ [0-9a-f-]{36}' | grep -oiE '[0-9a-f-]{36}$'; }
+# Surface UUIDs within a named workspace (broadcast --workspace).
+_ws_uuids() {
+  _tree_both | awk -v ws="$1" '
+    /workspace workspace:/ { if (match($0, /"[^"]*"/)) cur=substr($0, RSTART+1, RLENGTH-2) }
+    /surface surface:/ { if (cur==ws) for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F-]{36}$/) print $i }'
+}
+
+# Workspace ref (workspace:N) that contains a given surface ref/UUID. cmux needs
+# this context to target surfaces in other workspaces than the caller's.
+_ws_of() {
+  _tree_both | awk -v s="$1" '
+    /workspace workspace:/ { if (match($0, /workspace:[0-9]+/)) ws=substr($0, RSTART, RLENGTH); next }
+    /surface surface:/ {
+      ref=""; if (match($0, /surface:[0-9]+/)) ref=substr($0, RSTART, RLENGTH)
+      if (ref==s || index($0, s)>0) { print ws; exit }
+    }'
+}
+
+# Run a cmux surface command with auto-resolved --workspace context.
+_cmux_surface() {
+  local sub="$1" surface="$2"; shift 2
+  local ws; ws="$(_ws_of "$surface")"
+  if [ -n "$ws" ]; then "$CMUX_BIN" "$sub" --surface "$surface" --workspace "$ws" "$@"
+  else "$CMUX_BIN" "$sub" --surface "$surface" "$@"; fi
+}
+
+# --- readiness (keystroke channel) -----------------------------------------
+_busy() {
+  _cmux_surface read-screen "$1" --lines 40 2>/dev/null \
+    | grep -qiE '\([0-9]+s (·|\*)|esc to interrupt|Composing|Compacting'
+}
+_wait_idle() {
+  local surface="$1" timeout="${2:-120}" interval=2 waited=0 idle=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if _busy "$surface"; then idle=0; else idle=$((idle + 1)); [ "$idle" -ge 2 ] && return 0; fi
+    _nap "$interval"; waited=$((waited + interval))
+  done
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+c2c — Claude-to-Claude messaging over cmux
+
+Discovery
+  c2c whoami                     My surface ref + UUID + full identity
+  c2c list                       List all reachable surfaces
+
+Keystroke channel (immediate)
+  c2c send  <surface> <text>     Type into a peer and press Enter
+  c2c read  <surface> [lines]    Read a peer's screen (default 60)
+  c2c wait  <surface> [secs]     Block until the peer is idle (default 120)
+  c2c ask   <surface> <text>     Send, wait, read the reply
+  c2c ping  <surface>            Handshake
+
+Mailbox channel (push on next idle, via Stop hook)
+  c2c post  <surface> <text>              Drop a message in a peer's inbox (new thread)
+  c2c reply <thread> <text>               Reply within a thread (structured back-channel)
+  c2c ack   <thread> [text]               Acknowledge/close a thread (no-reply, ends ping-pong)
+  c2c broadcast --all|--workspace <ws>|--group <name> <text>
+                                          Fan-out to many peers (shared thread)
+  c2c group list|set <name> <ref...>|rm <name>|get <name>
+                                          Manage broadcast groups
+  c2c inbox                               Show my own pending inbox
+  c2c thread <thread-id>                  Show a thread transcript
+  c2c status <msg-id>                     Delivery receipt for a sent message
+  c2c receipts [n]                        Recent delivery receipts
+  c2c stop-hook                           Stop-hook entrypoint (reads stdin JSON)
+
+Surfaces are refs like `surface:18` (see `c2c list`) or raw UUIDs.
+Threads/msg-ids are printed by `post`/`reply`/`broadcast`.
+EOF
+}
+
+cmd="${1:-help}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  whoami|me)
+    ref="$(_self_ref)"; uuid="$(_self_uuid)"
+    [ -n "$ref" ]  && printf 'me:   %s\n' "$ref"
+    [ -n "$uuid" ] && printf 'uuid: %s\n\n' "$uuid"
+    "$CMUX_BIN" identify --json
+    ;;
+
+  list|ls|tree) "$CMUX_BIN" tree --all ;;
+
+  send)
+    [ $# -ge 2 ] || die "usage: c2c send <surface> <text>"
+    surface="$1"; shift; text="$*"
+    _cmux_surface send "$surface" -- "$text" >/dev/null || die "send fehlgeschlagen"
+    _cmux_surface send-key "$surface" enter >/dev/null || die "enter fehlgeschlagen"
+    printf 'sent -> %s\n' "$surface"
+    ;;
+
+  read|screen)
+    [ $# -ge 1 ] || die "usage: c2c read <surface> [lines]"
+    _cmux_surface read-screen "$1" --scrollback --lines "${2:-60}"
+    ;;
+
+  wait)
+    [ $# -ge 1 ] || die "usage: c2c wait <surface> [secs]"
+    if _wait_idle "$1" "${2:-120}"; then echo "idle: $1"; else die "timeout: $1 noch aktiv"; fi
+    ;;
+
+  ask)
+    [ $# -ge 2 ] || die "usage: c2c ask <surface> <text>"
+    surface="$1"; shift; text="$*"; self="$(_self_ref)"; self="${self:-unknown}"
+    hint=" (Antworte der aufrufenden Instanz zurueck mit: c2c send ${self} \"<deine Antwort>\".)"
+    _cmux_surface send "$surface" -- "[c2c <- ${self}] ${text}${hint}" >/dev/null || die "send fehlgeschlagen"
+    _cmux_surface send-key "$surface" enter >/dev/null || die "enter fehlgeschlagen"
+    printf 'asked %s (von %s), warte auf Antwort...\n' "$surface" "$self" >&2
+    _nap 2
+    _wait_idle "$surface" "${C2C_TIMEOUT:-120}" || printf 'c2c: Hinweis: %s evtl. noch aktiv (Timeout)\n' "$surface" >&2
+    echo "=== Antwort von $surface ==="
+    _cmux_surface read-screen "$surface" --scrollback --lines "${C2C_READ_LINES:-60}"
+    ;;
+
+  ping)
+    [ $# -ge 1 ] || die "usage: c2c ping <surface>"
+    self="$(_self_ref)"; self="${self:-unknown}"
+    exec "$0" ask "$1" "Ping von ${self}. Bitte bestaetige kurz den Empfang."
+    ;;
+
+  # --- Mailbox channel -----------------------------------------------------
+  post)
+    [ $# -ge 2 ] || die "usage: c2c post <surface> <text>"
+    target="$1"; shift; text="$*"
+    uuid="$(_resolve_uuid "$target")"; [ -n "$uuid" ] || die "Surface nicht auflösbar: $target"
+    MAIL post --self-uuid "$(_self_uuid)" --self-ref "$(_self_ref)" --to-uuid "$uuid" --text "$text"
+    ;;
+
+  reply)
+    [ $# -ge 2 ] || die "usage: c2c reply <thread> <text>"
+    thread="$1"; shift; text="$*"
+    MAIL reply --self-uuid "$(_self_uuid)" --self-ref "$(_self_ref)" --thread "$thread" --text "$text"
+    ;;
+
+  ack)
+    [ $# -ge 1 ] || die "usage: c2c ack <thread> [text]"
+    thread="$1"; shift; text="$*"
+    MAIL ack --self-uuid "$(_self_uuid)" --self-ref "$(_self_ref)" --thread "$thread" --text "$text"
+    ;;
+
+  broadcast|send-all)
+    # c2c broadcast --all|--workspace <ws>|--group <name> <text>
+    sel="${1:-}"; shift 2>/dev/null || true
+    case "$sel" in
+      --all)        targets="$(_all_uuids)" ;;
+      --workspace)  ws="$1"; shift; targets="$(_ws_uuids "$ws")" ;;
+      --group)      grp="$1"; shift; targets=""
+                    for r in $(MAIL group get "$grp"); do u="$(_resolve_uuid "$r")"; [ -n "$u" ] && targets="$targets $u"; done ;;
+      *) die "usage: c2c broadcast --all|--workspace <ws>|--group <name> <text>" ;;
+    esac
+    text="$*"; [ -n "$text" ] || die "leere Broadcast-Nachricht"
+    self_uuid="$(_self_uuid)"; self_ref="$(_self_ref)"
+    thread="$(uuidgen | tr 'A-Z' 'a-z' | tr -d '-' | cut -c1-12)"
+    n=0
+    for u in $targets; do                     # uuids sind wortsplit-sicher
+      [ "$u" = "$self_uuid" ] && continue     # nicht an mich selbst
+      MAIL post --self-uuid "$self_uuid" --self-ref "$self_ref" --to-uuid "$u" --text "$text" --thread "$thread" >/dev/null
+      n=$((n+1))
+    done
+    printf 'broadcast an %d Instanz(en), thread %s\n' "$n" "$thread"
+    ;;
+
+  group)
+    # c2c group list | set <name> <ref...> | rm <name> | get <name>
+    [ $# -ge 1 ] || die "usage: c2c group list|set <name> <ref...>|rm <name>|get <name>"
+    MAIL group "$@"
+    ;;
+
+  inbox)   MAIL inbox   --self-uuid "$(_self_uuid)" ;;
+  receipts)
+    if [ $# -ge 1 ]; then MAIL receipts --self-uuid "$(_self_uuid)" --limit "$1"
+    else MAIL receipts --self-uuid "$(_self_uuid)"; fi ;;
+
+  status)
+    [ $# -ge 1 ] || die "usage: c2c status <msg-id>"
+    MAIL status --self-uuid "$(_self_uuid)" --msg-id "$1"
+    ;;
+
+  thread)
+    [ $# -ge 1 ] || die "usage: c2c thread <thread-id>"
+    MAIL thread --thread "$1"
+    ;;
+
+  stop-hook)
+    # Stop-hook entrypoint. Consumes Claude's hook JSON on stdin, then lets the
+    # backend drain this surface's inbox and emit {"decision":"block","reason":…}.
+    # Empty inbox -> no output, instance stops normally (loop-safe via drain).
+    cat >/dev/null 2>&1 || true
+    uuid="$(_self_uuid)"; [ -n "$uuid" ] || exit 0
+    MAIL deliver --self-uuid "$uuid" --self-ref "$(_self_ref)"
+    ;;
+
+  help|-h|--help|"") usage ;;
+  *) die "unbekannter Befehl: $cmd (siehe: c2c help)" ;;
+esac
