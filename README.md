@@ -6,8 +6,9 @@ If you run several Claude Code sessions in parallel inside [cmux](https://cmux.c
 each lives in its own terminal *surface* — separate processes, separate contexts,
 no shared channel. `c2c` turns cmux's `send` / `send-key` / `read-screen`
 primitives into a small messaging protocol so those instances can coordinate:
-send a message, ask a question and get the answer, broadcast to a group, or drop
-a note that the peer picks up the next time it goes idle.
+send a message, ask a question and get the answer, broadcast to a group, drop a
+note that the peer picks up the next time it goes idle — and even **spawn new
+worker instances or tear them down** from within an agent.
 
 It works because a Claude Code instance with shell access isn't sandboxed from
 other processes: it can drive the `cmux` CLI over cmux's Unix socket and thereby
@@ -77,6 +78,11 @@ replace each other.
 c2c whoami                     # my surface ref + UUID
 c2c list                       # all reachable surfaces
 
+# Lifecycle
+c2c spawn                                  # launch a fresh yolo Claude in a new workspace
+c2c spawn --cwd ~/project --name worker    # ...with a cwd and name
+c2c kill  surface:31                       # terminate a peer instance
+
 # Keystroke channel (immediate)
 c2c send  surface:20 "push your branch, I'll merge"
 c2c ask   surface:20 "which task are you on?"     # send, wait, read the reply
@@ -142,6 +148,28 @@ Autonomous instances could otherwise acknowledge each other forever:
   `hookSpecificOutput.additionalContext`, **but** the turn completes: the note is
   seen at the peer's next turn, not acted on immediately. Trade-off: clean
   rendering vs. push semantics.
+
+## Spawning and killing instances
+
+`c2c spawn` creates a new cmux workspace and launches
+`claude --dangerously-skip-permissions` (yolo) in it, so an agent can bring up
+its own workers. The one-time *"trust this folder"* dialog — which
+`--dangerously-skip-permissions` does **not** skip — is auto-accepted, so the
+spawn is hands-off. The new instance reads `~/.claude/settings.json`, so it gets
+the c2c Stop hook (mailbox) immediately. Flags: `--cwd` (default: current dir),
+`--name`, `--command` (default: the yolo Claude line).
+
+`c2c kill <surface|workspace>` terminates a peer. If the surface is the only one
+in its workspace (a typical spawned worker), the whole workspace is closed;
+otherwise just that surface. Killing your own surface/workspace requires
+`--force`.
+
+```bash
+s=$(c2c spawn --cwd ~/project --name builder | grep -o 'surface:[0-9]*' | head -1)
+c2c post "$s" "run the full test suite and report back"
+# ... later ...
+c2c kill "$s"
+```
 
 ## Receiving instance
 

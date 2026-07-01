@@ -75,6 +75,24 @@ _cmux_surface() {
   else "$CMUX_BIN" "$sub" --surface "$surface" "$@"; fi
 }
 
+# First surface ref inside a workspace ref (for addressing a freshly spawned one).
+_surface_in_ws() {
+  _tree_both | awk -v w="$1" '
+    /workspace workspace:/ { if (match($0, /workspace:[0-9]+/)) cur=substr($0, RSTART, RLENGTH) }
+    /surface surface:/ { if (cur==w && match($0, /surface:[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit } }'
+}
+
+# Number of surfaces in a workspace ref (decide surface-close vs workspace-close).
+_ws_surface_count() {
+  _tree_both | awk -v w="$1" '
+    /workspace workspace:/ { if (match($0, /workspace:[0-9]+/)) cur=substr($0, RSTART, RLENGTH) }
+    /surface surface:/ { if (cur==w) n++ }
+    END { print n+0 }'
+}
+
+# My own workspace ref (for the self-kill guard).
+_self_ws() { "$CMUX_BIN" identify --json 2>/dev/null | sed -n 's/.*"workspace_ref"[^"]*"\([^"]*\)".*/\1/p' | head -n1; }
+
 # --- readiness (keystroke channel) -----------------------------------------
 _busy() {
   _cmux_surface read-screen "$1" --lines 40 2>/dev/null \
@@ -96,6 +114,13 @@ c2c — Claude-to-Claude messaging over cmux
 Discovery
   c2c whoami                     My surface ref + UUID + full identity
   c2c list                       List all reachable surfaces
+
+Lifecycle
+  c2c spawn [--cwd <dir>] [--name <n>] [--command <cmd>]
+                                 Launch a fresh Claude instance (yolo) in a new
+                                 workspace; prints its surface ref
+  c2c kill <surface|workspace> [--force]
+                                 Terminate a peer instance (self needs --force)
 
 Keystroke channel (immediate)
   c2c send  <surface> <text>     Type into a peer and press Enter
@@ -170,6 +195,75 @@ case "$cmd" in
     [ $# -ge 1 ] || die "usage: c2c ping <surface>"
     self="$(_self_ref)"; self="${self:-unknown}"
     exec "$0" ask "$1" "Ping von ${self}. Bitte bestaetige kurz den Empfang."
+    ;;
+
+  # --- Lifecycle: spawn / kill --------------------------------------------
+  spawn)
+    # c2c spawn [--cwd <dir>] [--name <name>] [--command <cmd>]
+    # Launches a fresh Claude Code instance (yolo / bypass permissions by
+    # default) in a new cmux workspace and prints its surface ref.
+    cwd="$PWD"; name="c2c-worker"; cmd="claude --dangerously-skip-permissions"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --cwd) cwd="$2"; shift 2 ;;
+        --name) name="$2"; shift 2 ;;
+        --command) cmd="$2"; shift 2 ;;
+        *) die "unbekannte spawn-Option: $1" ;;
+      esac
+    done
+    out="$("$CMUX_BIN" new-workspace --name "$name" --cwd "$cwd" --command "$cmd" --focus false 2>&1)"
+    ws="$(printf '%s' "$out" | grep -oiE 'workspace:[0-9]+' | head -n1)"
+    [ -n "$ws" ] || die "Spawn fehlgeschlagen: $out"
+    surface=""
+    for _ in 1 2 3 4 5 6; do surface="$(_surface_in_ws "$ws")"; [ -n "$surface" ] && break; _nap 1; done
+    # Auto-accept the one-time folder-trust dialog that even --dangerously-skip-
+    # permissions still shows on first launch in an untrusted directory (yolo =
+    # hands-off). Bails early once the instance is up or already trusted.
+    if [ -n "$surface" ]; then
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        scr="$(_cmux_surface read-screen "$surface" --lines 30 2>/dev/null)"
+        if printf '%s' "$scr" | grep -qiE "trust this folder|I trust this folder"; then
+          _cmux_surface send "$surface" -- "1" >/dev/null 2>&1
+          _cmux_surface send-key "$surface" enter >/dev/null 2>&1
+          break
+        elif printf '%s' "$scr" | grep -qiE "bypass permissions on|Welcome back|Tips for getting started"; then
+          break
+        fi
+        _nap 1
+      done
+    fi
+    printf 'spawned %s in %s\n  cwd: %s\n  cmd: %s\n' "${surface:-<surface pending>}" "$ws" "$cwd" "$cmd"
+    ;;
+
+  kill|close)
+    # c2c kill <surface|workspace> [--force]
+    # Terminates a peer instance. A dedicated worker (sole surface in its
+    # workspace) closes the whole workspace; otherwise just the surface.
+    [ $# -ge 1 ] || die "usage: c2c kill <surface|workspace> [--force]"
+    target="$1"; shift; force=0
+    [ "${1:-}" = "--force" ] && force=1
+    case "$target" in
+      workspace:*)
+        if [ "$target" = "$(_self_ws)" ] && [ "$force" -ne 1 ]; then
+          die "Ziel ist der eigene Workspace ($target). Mit --force erzwingen."
+        fi
+        "$CMUX_BIN" close-workspace --workspace "$target" >/dev/null || die "close-workspace fehlgeschlagen"
+        ;;
+      *)
+        if [ "$target" = "$(_self_ref)" ] && [ "$force" -ne 1 ]; then
+          die "Ziel ist die eigene Surface ($target). Mit --force erzwingen."
+        fi
+        ws="$(_ws_of "$target")"
+        n="$(_ws_surface_count "$ws")"
+        if [ -n "$ws" ] && [ "${n:-2}" -le 1 ]; then
+          "$CMUX_BIN" close-workspace --workspace "$ws" >/dev/null || die "close-workspace fehlgeschlagen"
+          target="$target ($ws)"
+        else
+          _cmux_surface close-surface "$target" >/dev/null || die "close-surface fehlgeschlagen"
+        fi
+        ;;
+    esac
+    printf 'killed %s\n' "$target"
     ;;
 
   # --- Mailbox channel -----------------------------------------------------

@@ -38,6 +38,10 @@ inline `--settings`-Hooks von cmux (empirisch verifiziert).
 c2c whoami                     # eigene Surface-Ref + UUID + volle Identität
 c2c list                       # alle erreichbaren Surfaces
 
+# Lifecycle
+c2c spawn [--cwd <dir>] [--name <n>] [--command <cmd>]   # neue Claude-Instanz (yolo) starten
+c2c kill  <surface|workspace> [--force]                  # Instanz beenden (self braucht --force)
+
 # Keystroke-Kanal (sofort)
 c2c send  <surface> <text>     # Text tippen + Enter
 c2c read  <surface> [lines]    # Bildschirm auslesen (default 60)
@@ -110,6 +114,20 @@ Damit sich zwei Instanzen nicht endlos gegenseitig bestätigen:
 5. **Zurückantworten.** Empfängt eine Instanz eine `[c2c <- surface:N]`-Nachricht
    (Keystroke) oder eine Mailbox-Injektion, antwortet sie dem Absender mit
    `c2c send surface:N "<Antwort>"`. Die Antwort landet im Prompt des Absenders.
+
+## Instanzen starten & beenden (Lifecycle)
+
+- **`c2c spawn`** legt via `cmux new-workspace` einen neuen Workspace an und
+  startet dort `claude --dangerously-skip-permissions` (yolo). Der einmalige
+  „Trust this folder"-Dialog (den `--dangerously-skip-permissions` NICHT
+  überspringt) wird automatisch bestätigt. Gibt die Surface-Ref der neuen
+  Instanz aus. `--cwd` (Default aktuelles Verzeichnis), `--name`, `--command`
+  (Default die yolo-Claude-Zeile) sind optional. Die neue Instanz lädt
+  `~/.claude/settings.json` → hat damit den c2c-Stop-Hook (Mailbox) sofort aktiv.
+- **`c2c kill <surface|workspace>`** beendet eine Instanz. Ist die Surface die
+  einzige ihres Workspaces (typischer `spawn`-Worker), wird der ganze Workspace
+  geschlossen, sonst nur die Surface. Die eigene Surface/den eigenen Workspace
+  killt es nur mit `--force` (Selbstschutz).
 
 ## Als empfangende Instanz
 
