@@ -156,9 +156,9 @@ OUT=$(c2c post surface:18 "Status deines Tasks?")   # -> {"id":…,"thread":…}
 c2c status <msg-id>                                  # zugestellt?
 c2c reply <thread-id> "Bei mir 80% fertig."          # Antwort im selben Thread
 c2c thread <thread-id>                               # ganzer Verlauf
-c2c group set probo surface:14 surface:16
-c2c broadcast --group probo "Bitte alle Status posten."
-c2c broadcast --workspace faktum "Deploy-Fenster in 10min."
+c2c group set devs surface:14 surface:16
+c2c broadcast --group devs "Bitte alle Status posten."
+c2c broadcast --workspace staging "Deploy-Fenster in 10min."
 ```
 
 ## Grenzen & Hinweise

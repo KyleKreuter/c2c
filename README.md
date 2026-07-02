@@ -100,7 +100,7 @@ c2c receipts [n]                                             # recent receipts
 # Broadcast / groups
 c2c group set devs surface:14 surface:16
 c2c broadcast --group devs "please post status"
-c2c broadcast --workspace faktum "deploy window in 10min"
+c2c broadcast --workspace staging "deploy window in 10min"
 c2c broadcast --all "heads up: rebasing main"
 ```
 
